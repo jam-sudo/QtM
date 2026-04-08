@@ -1,0 +1,87 @@
+# QtM default hyperparameter configuration
+# Project Sisyphus-Q: PINN PBPK System
+
+# ── Data paths ────────────────────────────────────────
+data:
+  physiology_yaml: configs/reference_man.yaml
+  clinical_pk_json: /home/jam/Sisyphus/data/reference/clinical_pk.json
+  mmpk_csv: /home/jam/Sisyphus/data/training/mmpk_expanded_full.csv
+  pbpk_features_csv: /home/jam/Sisyphus/data/training/mmpk_pbpk_features.csv
+  clint_csv: /home/jam/Sisyphus/data/training/clint_expanded_v2.csv
+  vdss_csv: /home/jam/Sisyphus/data/training/vdss_v2_training.csv
+  ppb_tab: /home/jam/Sisyphus/data/ppbr_az.tab
+  holdout_json: /home/jam/Sisyphus/data/reference/holdout.json
+  hdf5_path: data/molecules.h5
+  kp_baselines_csv: data/kp_baselines.csv
+  splits_json: data/splits.json
+  norm_stats_json: data/norm_stats.json
+
+# ── Scaffold split ────────────────────────────────────
+split:
+  ratios: [0.8, 0.1, 0.1]  # train/val/test
+  seed: 42
+
+# ── HDF5 generation ──────────────────────────────────
+hdf5:
+  max_workers: 14           # leave 2 threads for OS
+  cutoff: 10.0              # Angstrom, for radius graph
+
+# ── Encoder (Module B) ───────────────────────────────
+encoder:
+  hidden_channels: 128
+  num_interactions: 3
+  num_gaussians: 25
+  cutoff: 10.0
+  max_z: 100
+
+# ── Projector (Module C) ─────────────────────────────
+projector:
+  z_dim: 128                # must match encoder.hidden_channels
+  hidden_dim: 64
+
+# ── ODE solver (Module D) ────────────────────────────
+ode:
+  t_max_h: 72.0             # max simulation time (hours)
+  t_points: 200             # dense grid points
+  implicit_epochs: 20       # epochs using implicit_adams
+  implicit_rtol: 1.0e-3
+  implicit_atol: 1.0e-5
+  explicit_rtol: 1.0e-4
+  explicit_atol: 1.0e-6
+
+# ── Stage 1: ADME pretraining ────────────────────────
+stage1:
+  epochs: 100
+  batch_size: 64
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  scheduler: cosine
+  target_names:
+    - log_clint
+    - logit_fup
+    - log_vdss
+    - log_papp
+    - log_thalf
+
+# ── Stage 2: ODE fine-tuning ─────────────────────────
+stage2:
+  epochs: 50
+  batch_size: 8
+  accum_steps: 4            # effective batch = 32
+  encoder_lr: 1.0e-5        # 10x lower than projector
+  projector_lr: 1.0e-4
+  weight_decay: 1.0e-5
+  scheduler: cosine
+  freeze_encoder_epochs: 10
+  grad_clip_norm: 1.0
+
+# ── PINN loss ─────────────────────────────────────────
+loss:
+  lambda_max: 1.0           # max mass balance penalty weight
+  warmup_epochs: 20         # anneal lambda from 0 to max
+
+# ── Logging ───────────────────────────────────────────
+logging:
+  run_log: logs/runs.jsonl
+  checkpoint_dir: checkpoints/
+  save_every_epochs: 10
