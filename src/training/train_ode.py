@@ -6,7 +6,7 @@ Trains the full QtM pipeline (encoder → projector → Neural ODE) on
 Key features:
 - PSSA (Pseudo-Steady State Approximation) for 3 central blood pools,
   reducing ODE stiffness from λ=1482 to λ≈118 h⁻¹
-- Windowed truncated BPTT (4h windows) for bounded memory backward
+- Windowed truncated BPTT (0.5h windows) for bounded memory backward
 - rk4 fixed-step (dt=0.005h) for predictable compute graphs
 - Strict parameter clamping in Module C prevents solver blowup
 - Annealed PINN loss (data MSLE + mass balance)
@@ -27,7 +27,7 @@ import torch.nn as nn
 from torch import Tensor
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torchdiffeq import odeint, odeint_adjoint
+from torchdiffeq import odeint
 
 from src.data.graph_topology import PBPKTopology, load_topology
 from src.models.encoder import SchNetEncoder
@@ -256,7 +256,10 @@ def train_one_epoch(
 
         # Expand to full 34-node state for venous concentration + mass balance
         sol_full = wrapper.expand_solution(sol)
-        venous_conc = sol_full[:, :, topo.venous_idx] / volumes[topo.venous_idx]
+        # C_plasma = C_blood / rbp (clinical PK data reports plasma concentration)
+        venous_conc = sol_full[:, :, topo.venous_idx] / (
+            volumes[topo.venous_idx] * drug_params.rbp.unsqueeze(0)
+        )
 
         # Per-molecule interpolation to observation times
         losses = []
