@@ -19,7 +19,7 @@ SMILES &rarr; 3D conformer &rarr; SchNet encoder &rarr; PBPK parameter projector
 | **A** Quantum Generator | RDKit ETKDGv3 conformer + Gasteiger charges &rarr; HDF5 | Offline |
 | **B** SchNet Encoder | 3-layer continuous-filter convolution, E(n)-invariant | 254,080 |
 | **C** Hierarchical Projector | Tissue-grouped attention &rarr; 30 drug-dependent ODE parameters | 18,846 |
-| **D** PBPK ODE | 34-node multigraph (ICRP Reference Man, 70 kg), 6 flux types | 0 (physics) |
+| **D** PBPK ODE | 34-node multigraph (ICRP Reference Man, 70 kg), 5 flux types | 0 (physics) |
 
 **Total trainable parameters: 272,926**
 
@@ -71,8 +71,8 @@ Trains SchNet encoder to produce meaningful molecular representations before ODE
 
 Full pipeline (encoder &rarr; projector &rarr; ODE) on 265 drugs with clinical concentration-time curves.
 
-- Encoder frozen for first 10 epochs, then fine-tuned at lr 1e-5
-- Projector lr 1e-4, gradient accumulation (effective batch = 8)
+- Encoder frozen (default config: `freeze_encoder_epochs` = `epochs` = 10)
+- Projector lr 1e-4, encoder lr 1e-5 (active when unfrozen), gradient accumulation (effective batch = 8)
 - rk4 fixed-step (dt=0.005h), truncated BPTT with 0.5h windows
 - Loss: MSLE(C_plasma_pred, C_plasma_obs) + &lambda;(epoch) &times; mass balance penalty
 
@@ -104,7 +104,7 @@ Data leakage prevention: Murcko scaffold split, train-only normalization, Kp bas
 - PyTorch Geometric 2.7+
 - torchdiffeq 0.2+
 - RDKit 2023+
-- h5py, pandas, pyyaml, scipy
+- h5py, pandas, pyyaml
 
 ### Data Preparation
 
@@ -132,7 +132,7 @@ python -m scripts.run_training --config configs/default.yaml --stage both --devi
 python -m scripts.run_training --config configs/default.yaml --dry-run --device cpu
 ```
 
-Stage 2 runs on CPU by default (batch_size=1 ODE solves are faster on CPU than GPU due to kernel launch overhead for 31-dimensional state vectors).
+Stage 2 is recommended to run on CPU (`--device cpu`). With batch_size=1, the 31-dimensional ODE solves are ~8x faster on CPU than GPU due to CUDA kernel launch overhead.
 
 ## Project Structure
 
