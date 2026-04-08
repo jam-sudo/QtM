@@ -290,15 +290,24 @@ def train_one_epoch(
         batch_data = torch.stack([l["data"] for l in losses]).mean()
         batch_mb = torch.stack([l["mass_balance"] for l in losses]).mean()
 
-        # Gradient accumulation
+        # Gradient accumulation with NaN guard
         scaled_loss = batch_loss / accum_steps
         scaled_loss.backward()
 
+        # Check for NaN gradients (float32 overflow in backward through ODE)
+        all_params = list(encoder.parameters()) + list(projector.parameters())
+        has_nan_grad = any(
+            p.grad is not None and torch.isnan(p.grad).any()
+            for p in all_params
+        )
+        if has_nan_grad:
+            # Discard corrupted gradients — do NOT step optimizer
+            optimizer.zero_grad()
+            n_diverged += batch_size
+            continue
+
         if (batch_idx + 1) % accum_steps == 0:
-            torch.nn.utils.clip_grad_norm_(
-                list(encoder.parameters()) + list(projector.parameters()),
-                max_norm=1.0,
-            )
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
 
@@ -309,11 +318,11 @@ def train_one_epoch(
 
     # Final optimizer step for remaining gradients
     if n_batches % accum_steps != 0:
-        torch.nn.utils.clip_grad_norm_(
-            list(encoder.parameters()) + list(projector.parameters()),
-            max_norm=1.0,
-        )
-        optimizer.step()
+        all_params = list(encoder.parameters()) + list(projector.parameters())
+        has_nan = any(p.grad is not None and torch.isnan(p.grad).any() for p in all_params)
+        if not has_nan:
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            optimizer.step()
         optimizer.zero_grad()
 
     divergence_rate = n_diverged / max(n_molecules, 1)
