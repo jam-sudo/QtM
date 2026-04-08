@@ -143,19 +143,24 @@ class HierarchicalProjector(nn.Module):
         delta_kp_raw = self.kp_head(h_unified)          # [batch, 15]
         # Kp = Kp_baseline × exp(tanh(Δ)) — range [base/e, base×e]
         kp = kp_baseline * torch.exp(torch.tanh(delta_kp_raw))
-        # Hard clamp for safety
-        kp = kp.clamp(min=0.01, max=50.0)
+        # Hard clamp: Kp_min=1.0 guarantees rk4 (dt=0.005h) stability.
+        # Worst case: kidney λ = Q*rbp/(V*Kp) = 74.1*2/(0.31*1.0) = 478 h⁻¹
+        # → λ*dt = 2.39 < 2.78 (rk4 stability limit).
+        # Kp<1.0 causes kidney λ*dt > 2.78 → solver divergence + NaN gradients.
+        kp = kp.clamp(min=1.0, max=50.0)
 
         # ── Enzyme affinities ────────────────────────────────────
-        # Scale to biological range: typical affinity 0.001-0.1 (µL/min/pmol)
-        # softplus default output ~0.7 → scale by 0.01 → ~0.007
+        # Bounded sigmoid [0.001, 0.1] µL/min/pmol.
+        # Max CLint_liver = 9.2M × 0.1 × 6e-5 = 55 L/h (physiological).
+        # Unbounded softplus caused CLint=893 L/h at init → solver blowup.
         enz_raw = self.enzyme_head(h_unified)            # [batch, 5]
-        enzyme_affinities = F.softplus(enz_raw) * 0.01   # scaled to ~0.001-0.01
+        enzyme_affinities = torch.sigmoid(enz_raw) * 0.099 + 0.001
 
         # ── PS products ──────────────────────────────────────────
-        # Default PS from YAML is 10.0 L/h; scale around that
+        # Bounded sigmoid [1.0, 50.0] L/h.
+        # Prevents extreme diffusion flux that increases stiffness.
         ps_raw = self.ps_head(h_unified)                 # [batch, 4]
-        ps = F.softplus(ps_raw) * 5.0 + 1.0              # range ~1-50 L/h
+        ps = torch.sigmoid(ps_raw) * 49.0 + 1.0
 
         # ── Scalar ADME ──────────────────────────────────────────
         adme_raw = self.adme_head(h_unified)             # [batch, 6]
@@ -163,10 +168,12 @@ class HierarchicalProjector(nn.Module):
         fup = torch.sigmoid(adme_raw[:, 0]) * 0.99 + 0.01
         # adme_raw[:, 1] → rbp: sigmoid to [0.5, 2.0]
         rbp = torch.sigmoid(adme_raw[:, 1]) * 1.5 + 0.5
-        # adme_raw[:, 2] → peff: softplus (×10⁻⁴ cm/s)
-        peff = F.softplus(adme_raw[:, 2]) + 0.01
-        # adme_raw[:, 3] → renal_cl: softplus (L/h)
-        renal_cl = F.softplus(adme_raw[:, 3])
+        # adme_raw[:, 2] → peff: bounded sigmoid [0.01, 10.0] (×10⁻⁴ cm/s)
+        # Prevents extreme absorption rate ka ∝ Peff / particle_radius.
+        peff = torch.sigmoid(adme_raw[:, 2]) * 9.99 + 0.01
+        # adme_raw[:, 3] → renal_cl: bounded sigmoid [0.01, 20.0] L/h
+        # Max ≈ 2.7× GFR, allows tubular secretion but prevents instability.
+        renal_cl = torch.sigmoid(adme_raw[:, 3]) * 19.99 + 0.01
         # adme_raw[:, 4] → particle_radius: sigmoid to [5, 50] µm
         particle_radius = torch.sigmoid(adme_raw[:, 4]) * 45.0 + 5.0
         # adme_raw[:, 5] → solubility: softplus (mg/mL)

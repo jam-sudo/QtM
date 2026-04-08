@@ -305,3 +305,249 @@ class ODEWrapper(nn.Module):
 
     def forward(self, t: Tensor, y: Tensor) -> Tensor:
         return self.pbpk_func(t, y)
+
+
+class PSSAWrapper(nn.Module):
+    """Pseudo-Steady State Approximation wrapper for the PBPK ODE.
+
+    Converts venous_blood, arterial_blood, and portal_vein from differential
+    to algebraic equations, reducing state dimension from 34 to 31.
+
+    These 3 blood pools have time constants < 35s (vs PK timescales of hours),
+    so their amounts satisfy instantaneous flow balance:
+
+        A_bp = V_bp × Σ(Q_in × C_out_src) / Q_out_total
+
+    This eliminates eigenvalues up to λ=1482 h⁻¹ (portal vein τ=2.4s),
+    reducing the stiffness ratio from ~1482:1 to ~118:1.
+
+    The 34-node topology is fully preserved — blood pool amounts are computed
+    algebraically at each ODE step, not removed from the system.
+    """
+
+    def __init__(
+        self,
+        pbpk_func: PBPKFunc,
+        topo: "PBPKTopology",
+        drug_params: DrugParams,
+    ):
+        super().__init__()
+        self.pbpk_func = pbpk_func
+        self.pbpk_func.set_drug_params(drug_params)
+        self.drug_params = drug_params
+        self.n_full = topo.n_nodes
+
+        device = topo.volumes.device
+
+        # PSSA node indices (sorted)
+        pssa_idx_list = sorted([
+            topo.venous_idx, topo.arterial_idx, topo.portal_vein_idx,
+        ])
+        ode_idx_list = [i for i in range(topo.n_nodes) if i not in pssa_idx_list]
+
+        self.register_buffer("pssa_indices", torch.tensor(pssa_idx_list, dtype=torch.long, device=device))
+        self.register_buffer("ode_indices", torch.tensor(ode_idx_list, dtype=torch.long, device=device))
+        self.n_reduced = len(ode_idx_list)
+
+        # Full-to-reduced index mapping (-1 for PSSA nodes)
+        full_to_red = torch.full((topo.n_nodes,), -1, dtype=torch.long, device=device)
+        for r_idx, f_idx in enumerate(ode_idx_list):
+            full_to_red[f_idx] = r_idx
+        self.register_buffer("full_to_reduced", full_to_red)
+
+        # Useful mapped indices
+        self.stomach_idx_reduced = full_to_red[topo.stomach_idx].item()
+        self.venous_pssa_pos = pssa_idx_list.index(topo.venous_idx)
+        self.venous_idx_full = topo.venous_idx
+
+        # Topology data for PSSA computation
+        self.register_buffer("volumes_full", topo.volumes)
+        tissue_mask = (~topo.is_blood_pool & ~topo.is_lumen & ~topo.is_sink)
+        self.register_buffer("tissue_mask", tissue_mask)
+
+        # Pre-compute flow structure for each PSSA node
+        self._build_pssa_structure(topo, pssa_idx_list, tissue_mask)
+
+    def _build_pssa_structure(
+        self,
+        topo: "PBPKTopology",
+        pssa_idx_list: list,
+        tissue_mask: Tensor,
+    ) -> None:
+        """Pre-compute inflow sources and outflow rates for PSSA nodes.
+
+        For each PSSA node, registers buffers:
+            pssa_{i}_src_reduced  — source indices in reduced state
+            pssa_{i}_src_full    — source indices in full 34-node state
+            pssa_{i}_rates       — flow rates per inflow edge
+            pssa_{i}_is_tissue   — whether each source is a tissue node
+        """
+        pssa_set = set(pssa_idx_list)
+        device = topo.volumes.device
+
+        flow_src = topo.flow_src.tolist()
+        flow_tgt = topo.flow_tgt.tolist()
+        flow_rates = topo.flow_rates.tolist()
+
+        q_outs = []
+        v_bps = []
+
+        for i, bp_idx in enumerate(pssa_idx_list):
+            in_src_full, in_src_reduced, in_rates, in_is_tissue = [], [], [], []
+
+            for j in range(len(flow_src)):
+                if flow_tgt[j] == bp_idx:
+                    s = flow_src[j]
+                    assert s not in pssa_set, (
+                        f"PSSA node {topo.node_names[bp_idx]} receives flow from "
+                        f"another PSSA node {topo.node_names[s]}. "
+                        f"Cannot solve algebraic equations independently."
+                    )
+                    in_src_full.append(s)
+                    in_src_reduced.append(self.full_to_reduced[s].item())
+                    in_rates.append(flow_rates[j])
+                    in_is_tissue.append(tissue_mask[s].item())
+
+            q_out = sum(
+                flow_rates[j] for j in range(len(flow_src))
+                if flow_src[j] == bp_idx
+            )
+            q_outs.append(q_out)
+            v_bps.append(topo.volumes[bp_idx].item())
+
+            self.register_buffer(
+                f"pssa_{i}_src_reduced",
+                torch.tensor(in_src_reduced, dtype=torch.long, device=device),
+            )
+            self.register_buffer(
+                f"pssa_{i}_src_full",
+                torch.tensor(in_src_full, dtype=torch.long, device=device),
+            )
+            self.register_buffer(
+                f"pssa_{i}_rates",
+                torch.tensor(in_rates, dtype=torch.float32, device=device),
+            )
+            self.register_buffer(
+                f"pssa_{i}_is_tissue",
+                torch.tensor(in_is_tissue, dtype=torch.bool, device=device),
+            )
+
+        self.register_buffer(
+            "pssa_q_out",
+            torch.tensor(q_outs, dtype=torch.float32, device=device),
+        )
+        self.register_buffer(
+            "pssa_v_bp",
+            torch.tensor(v_bps, dtype=torch.float32, device=device),
+        )
+        self.n_pssa = len(pssa_idx_list)
+
+    def _compute_pssa_amounts(self, y_reduced: Tensor) -> Tensor:
+        """Compute algebraic steady-state amounts for the 3 PSSA nodes.
+
+        For each blood pool bp:
+            inflow = Σ Q_j × C_out_j   (flow from connected ODE nodes)
+            A_bp = V_bp × inflow / Q_out_total
+
+        C_out depends on source type:
+            tissue:     A × rbp / (V × Kp)
+            blood pool: A / V
+
+        Args:
+            y_reduced: [batch, 31] amounts for ODE nodes.
+
+        Returns:
+            [batch, 3] amounts for PSSA nodes, ordered by pssa_indices.
+        """
+        batch = y_reduced.shape[0]
+        dp = self.drug_params
+        kp_full = self.pbpk_func._expand_kp_to_nodes(dp.kp)  # [batch, 34]
+
+        results = []
+        for i in range(self.n_pssa):
+            src_r = getattr(self, f"pssa_{i}_src_reduced")
+            src_f = getattr(self, f"pssa_{i}_src_full")
+            q_in = getattr(self, f"pssa_{i}_rates")
+            is_tissue = getattr(self, f"pssa_{i}_is_tissue")
+            n_in = len(src_r)
+
+            a_src = y_reduced[:, src_r]           # [batch, n_in]
+            v_src = self.volumes_full[src_f]       # [n_in]
+            kp_src = kp_full[:, src_f]             # [batch, n_in]
+
+            # rbp for tissue sources, 1.0 for blood pool sources
+            rbp_factor = torch.where(
+                is_tissue.unsqueeze(0).expand(batch, -1),
+                dp.rbp.view(-1, 1).expand(batch, n_in),
+                torch.ones(batch, n_in, device=y_reduced.device),
+            )
+
+            c_out = a_src * rbp_factor / (v_src.unsqueeze(0) * kp_src + 1e-30)
+            total_inflow = (q_in.unsqueeze(0) * c_out).sum(dim=1)  # [batch]
+            a_bp = self.pssa_v_bp[i] * total_inflow / (self.pssa_q_out[i] + 1e-30)
+            results.append(a_bp)
+
+        return torch.stack(results, dim=1)  # [batch, 3]
+
+    def forward(self, t: Tensor, y_reduced: Tensor) -> Tensor:
+        """Compute dy/dt for the reduced 31-dim state.
+
+        Steps:
+            1. Clamp ODE state to non-negative.
+            2. Compute blood pool amounts algebraically.
+            3. Assemble full 34-dim state via scatter.
+            4. Evaluate full RHS via PBPKFunc.
+            5. Return only ODE node rates.
+
+        Args:
+            t: Current time (hours).
+            y_reduced: [batch, 31] ODE node amounts.
+
+        Returns:
+            [batch, 31] dy/dt for ODE nodes.
+        """
+        batch = y_reduced.shape[0]
+        y_reduced = y_reduced.clamp(min=0.0)
+
+        # Algebraic blood pool amounts
+        pssa_amounts = self._compute_pssa_amounts(y_reduced)
+
+        # Assemble full state (out-of-place scatter for autograd safety)
+        ode_exp = self.ode_indices.unsqueeze(0).expand(batch, -1)
+        pssa_exp = self.pssa_indices.unsqueeze(0).expand(batch, -1)
+        y_full = torch.zeros(
+            batch, self.n_full, device=y_reduced.device, dtype=y_reduced.dtype,
+        )
+        y_full = y_full.scatter(1, ode_exp, y_reduced)
+        y_full = y_full.scatter(1, pssa_exp, pssa_amounts)
+
+        dydt_full = self.pbpk_func(t, y_full)
+        return dydt_full.gather(1, ode_exp)
+
+    def expand_solution(self, solution_reduced: Tensor) -> Tensor:
+        """Expand reduced ODE solution to full 34-node state.
+
+        Computes algebraic blood pool amounts at each timepoint.
+
+        Args:
+            solution_reduced: [T, batch, 31] solution at evaluation times.
+
+        Returns:
+            [T, batch, 34] full state including PSSA nodes.
+        """
+        T, batch, _ = solution_reduced.shape
+        device = solution_reduced.device
+
+        ode_exp = self.ode_indices.unsqueeze(0).expand(batch, -1)
+        pssa_exp = self.pssa_indices.unsqueeze(0).expand(batch, -1)
+
+        slices = []
+        for t_idx in range(T):
+            y_t = solution_reduced[t_idx]
+            pssa_t = self._compute_pssa_amounts(y_t)
+            row = torch.zeros(batch, self.n_full, device=device, dtype=y_t.dtype)
+            row = row.scatter(1, ode_exp, y_t)
+            row = row.scatter(1, pssa_exp, pssa_t)
+            slices.append(row)
+
+        return torch.stack(slices)  # [T, batch, 34]

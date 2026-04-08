@@ -4,8 +4,11 @@ Trains the full QtM pipeline (encoder → projector → Neural ODE) on
 284 drugs with clinical PK profiles from Sisyphus clinical_pk.json.
 
 Key features:
-- Adaptive solver transition: implicit_adams → dopri5
-- odeint_adjoint for O(1) VRAM backpropagation
+- PSSA (Pseudo-Steady State Approximation) for 3 central blood pools,
+  reducing ODE stiffness from λ=1482 to λ≈118 h⁻¹
+- Windowed truncated BPTT (4h windows) for bounded memory backward
+- rk4 fixed-step (dt=0.005h) for predictable compute graphs
+- Strict parameter clamping in Module C prevents solver blowup
 - Annealed PINN loss (data MSLE + mass balance)
 - Solver divergence logging (§6.1)
 - Gradient accumulation for effective larger batches
@@ -28,7 +31,7 @@ from torchdiffeq import odeint, odeint_adjoint
 
 from src.data.graph_topology import PBPKTopology, load_topology
 from src.models.encoder import SchNetEncoder
-from src.models.ode_system import DrugParams, ODEWrapper, PBPKFunc
+from src.models.ode_system import DrugParams, ODEWrapper, PBPKFunc, PSSAWrapper
 from src.models.projector import HierarchicalProjector
 from src.training.logger import RunLogger
 from src.training.loss import annealed_pinn_loss
@@ -36,52 +39,90 @@ from src.training.loss import annealed_pinn_loss
 logger = logging.getLogger(__name__)
 
 
-def solve_ode_safe(
-    wrapper: ODEWrapper,
+def solve_ode_windowed(
+    wrapper,
     y0: Tensor,
     t_eval: Tensor,
-    method: str,
-    rtol: float,
-    atol: float,
-    adjoint_params: tuple,
-    use_adjoint: bool = True,
-    step_size: float = 0.5,
+    method: str = "dopri5",
+    rtol: float = 1e-3,
+    atol: float = 1e-5,
+    window_hours: float = 4.0,
+    options: dict | None = None,
 ) -> Tuple[Optional[Tensor], Optional[str]]:
-    """Solve ODE with error handling for divergence.
+    """Solve ODE using truncated BPTT with time-windowing.
 
-    Returns (solution, None) on success, (None, error_msg) on failure.
-    Divergent molecules are NEVER silently dropped (§6.1).
+    Splits the time horizon into windows. Within each window, solve with
+    odeint (non-adjoint) for short-range gradient flow. Between windows,
+    detach the state to limit memory and prevent backward instability.
+
+    This avoids:
+    - OOM from non-adjoint on full horizon
+    - NaN from adjoint backward on stiff systems
+    - Instability from fixed-step solvers
 
     Args:
-        use_adjoint: If True, use odeint_adjoint (O(1) VRAM, slower).
-                     If False, use odeint (stores all states, faster for small batches).
+        wrapper: ODE function wrapper (ODEWrapper or PSSAWrapper).
+        y0: [batch, N] initial state (N=34 for ODEWrapper, 31 for PSSAWrapper).
+        t_eval: [T] evaluation timepoints (sorted).
+        method: ODE solver method.
+        rtol: Relative tolerance.
+        atol: Absolute tolerance.
+        window_hours: Duration of each BPTT window.
+
+    Returns:
+        (solution, None) on success, (None, error_msg) on failure.
+        solution: [T, batch, N] amounts at t_eval points.
     """
     try:
-        # Build solver kwargs — fixed-step solvers (rk4, euler) use step_size
-        # instead of rtol/atol
-        is_fixed_step = method in ("rk4", "euler", "midpoint")
-        solve_fn = odeint_adjoint if use_adjoint else odeint
+        device = y0.device
+        t_max = t_eval[-1].item()
+        batch = y0.shape[0]
+        n_states = y0.shape[1]
 
-        kwargs = {"method": method}
-        if is_fixed_step:
-            kwargs["options"] = {"step_size": step_size}
-            if use_adjoint:
-                kwargs["adjoint_options"] = {"step_size": step_size}
-        else:
-            kwargs["rtol"] = rtol
-            kwargs["atol"] = atol
-            kwargs["options"] = {"max_num_steps": 10000}
-            if use_adjoint:
-                kwargs["adjoint_options"] = {"max_num_steps": 10000}
+        # Collect solutions at evaluation points
+        all_solutions = [y0.unsqueeze(0)]  # t=0
+        y_current = y0
 
-        if use_adjoint:
-            kwargs["adjoint_params"] = adjoint_params
+        # Define windows
+        window_start = 0.0
+        eval_idx = 1  # skip t=0
 
-        solution = solve_fn(wrapper, y0, t_eval, **kwargs)
-        # Check for NaN
-        if torch.isnan(solution).any():
-            return None, "NaN in ODE solution"
+        while window_start < t_max and eval_idx < len(t_eval):
+            window_end = min(window_start + window_hours, t_max)
+
+            # Gather eval points in this window
+            window_t = [torch.tensor(window_start, device=device)]
+            while eval_idx < len(t_eval) and t_eval[eval_idx].item() <= window_end + 1e-6:
+                window_t.append(t_eval[eval_idx])
+                eval_idx += 1
+            if len(window_t) == 1:
+                # No eval points in window — add endpoint
+                window_t.append(torch.tensor(window_end, device=device))
+
+            window_t = torch.stack(window_t)
+
+            # Solve this window (with PSSA: ~800 rk4 steps or ~200 dopri5 steps per 4h)
+            opts = options if options is not None else {"max_num_steps": 10000}
+            window_sol = odeint(
+                wrapper, y_current, window_t,
+                method=method, rtol=rtol, atol=atol,
+                options=opts,
+            )  # [len(window_t), batch, N]
+
+            # Check for NaN
+            if torch.isnan(window_sol).any():
+                return None, f"NaN in window [{window_start:.1f}, {window_end:.1f}]h"
+
+            # Store solutions at eval points (skip the first which is window_start)
+            all_solutions.append(window_sol[1:])
+
+            # Detach state for next window (truncated BPTT)
+            y_current = window_sol[-1].detach().requires_grad_(True)
+            window_start = window_end
+
+        solution = torch.cat(all_solutions, dim=0)  # [T, batch, 34]
         return solution, None
+
     except RuntimeError as e:
         return None, str(e)
 
@@ -117,19 +158,21 @@ def interpolate_to_obs(
 
 
 def get_solver_config(epoch: int) -> dict:
-    """Adaptive solver transition strategy.
+    """Epoch-dependent solver configuration.
 
-    Epoch 0-20:  rk4 fixed-step (fast, predictable compute graph)
-                 step_size=0.5h → 96 steps for 48h → GPU-efficient
-    Epoch 21+:   dopri5 adaptive (higher accuracy after params stabilize)
-
-    Fixed-step solvers are critical for early training: adaptive solvers
-    generate thousands of internal steps with uncalibrated params, making
-    adjoint backward intractable (hours per epoch).
+    Epoch 0-9:   rk4 fixed-step (dt=0.005h). Predictable compute graph,
+                 ~7s/molecule. Stable for λ_max ≈ 143 h⁻¹ (λdt=0.72 < 2.78).
+    Epoch 10+:   dopri5 adaptive (rtol=5e-2). Better accuracy as params
+                 stabilize; adaptive step avoids wasted evaluations.
     """
     if epoch < 10:
-        return {"method": "dopri5", "rtol": 1e-3, "atol": 1e-5}
-    return {"method": "dopri5", "rtol": 1e-4, "atol": 1e-6}
+        return {"method": "rk4", "options": {"step_size": 0.005}}
+    return {
+        "method": "dopri5",
+        "rtol": 5e-2,
+        "atol": 1e-3,
+        "options": {"max_num_steps": 10000},
+    }
 
 
 def train_one_epoch(
@@ -191,26 +234,18 @@ def train_one_epoch(
         z_mol = encoder(batch.z, batch.pos, batch.charges, batch.edge_index, batch.batch)
         drug_params = projector(z_mol, batch.kp_baseline)
 
-        # ODE solve
-        y0 = torch.zeros(batch_size, topo.n_nodes, device=device)
-        y0[:, topo.stomach_idx] = batch.dose_mg.squeeze(-1)
+        # ODE solve with PSSA (reduced 31-dim state)
+        wrapper = PSSAWrapper(pbpk_func, topo, drug_params)
+        y0 = torch.zeros(batch_size, wrapper.n_reduced, device=device)
+        y0[:, wrapper.stomach_idx_reduced] = batch.dose_mg.squeeze(-1)
 
-        wrapper = ODEWrapper(pbpk_func, drug_params)
-        adjoint_params = (
-            tuple(encoder.parameters()) + tuple(projector.parameters())
-            + (drug_params.kp, drug_params.enzyme_affinities, drug_params.ps,
-               drug_params.fup, drug_params.rbp, drug_params.peff,
-               drug_params.renal_cl, drug_params.particle_radius)
-        )
-
-        sol, err = solve_ode_safe(
+        sol, err = solve_ode_windowed(
             wrapper, y0, t_common,
             method=solver_cfg["method"],
-            rtol=solver_cfg.get("rtol", 1e-3),
-            atol=solver_cfg.get("atol", 1e-5),
-            adjoint_params=adjoint_params,
-            use_adjoint=use_adjoint,
-            step_size=solver_cfg.get("options", {}).get("step_size", 0.5),
+            rtol=solver_cfg.get("rtol", 1e-2),
+            atol=solver_cfg.get("atol", 1e-4),
+            window_hours=0.5,
+            options=solver_cfg.get("options"),
         )
 
         if sol is None:
@@ -219,8 +254,9 @@ def train_one_epoch(
                 run_logger.log_divergence(epoch, batch.mol_id[i], err)
             continue
 
-        # Extract venous concentrations and interpolate
-        venous_conc = sol[:, :, topo.venous_idx] / volumes[topo.venous_idx]
+        # Expand to full 34-node state for venous concentration + mass balance
+        sol_full = wrapper.expand_solution(sol)
+        venous_conc = sol_full[:, :, topo.venous_idx] / volumes[topo.venous_idx]
 
         # Per-molecule interpolation to observation times
         losses = []
@@ -236,7 +272,7 @@ def train_one_epoch(
             loss_dict = annealed_pinn_loss(
                 pred_conc=pred_at_obs.unsqueeze(-1),
                 obs_conc=obs_c.unsqueeze(-1),
-                solution=sol[:, i:i+1, :],
+                solution=sol_full[:, i:i+1, :],
                 dose_mg=batch.dose_mg[i:i+1].squeeze(-1),
                 epoch=epoch,
                 lambda_max=lambda_max,
