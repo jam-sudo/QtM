@@ -271,7 +271,7 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
             accum_steps=s2.get("accum_steps", 4),
             lambda_max=cfg["loss"]["lambda_max"],
             warmup_epochs=cfg["loss"]["warmup_epochs"],
-            use_adjoint=not dry_run,  # non-adjoint for dry run (faster)
+            use_adjoint=False,  # non-adjoint: faster backward, VRAM ok for batch≤8
         )
         scheduler.step()
 

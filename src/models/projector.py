@@ -147,12 +147,15 @@ class HierarchicalProjector(nn.Module):
         kp = kp.clamp(min=0.01, max=50.0)
 
         # ── Enzyme affinities ────────────────────────────────────
+        # Scale to biological range: typical affinity 0.001-0.1 (µL/min/pmol)
+        # softplus default output ~0.7 → scale by 0.01 → ~0.007
         enz_raw = self.enzyme_head(h_unified)            # [batch, 5]
-        enzyme_affinities = F.softplus(enz_raw)          # strictly positive
+        enzyme_affinities = F.softplus(enz_raw) * 0.01   # scaled to ~0.001-0.01
 
         # ── PS products ──────────────────────────────────────────
+        # Default PS from YAML is 10.0 L/h; scale around that
         ps_raw = self.ps_head(h_unified)                 # [batch, 4]
-        ps = F.softplus(ps_raw) + 0.1                    # minimum 0.1 L/h
+        ps = F.softplus(ps_raw) * 5.0 + 1.0              # range ~1-50 L/h
 
         # ── Scalar ADME ──────────────────────────────────────────
         adme_raw = self.adme_head(h_unified)             # [batch, 6]

@@ -169,6 +169,9 @@ class PBPKFunc(nn.Module):
         assert dp is not None, "Call set_drug_params() before forward()"
 
         batch = y.shape[0]
+        # Clamp amounts to non-negative for numerical stability
+        # (negative amounts are non-physical and cause feedback instability)
+        y = y.clamp(min=0.0)
         dydt = torch.zeros_like(y)
 
         # Expand drug params to full node dimensions

@@ -181,9 +181,19 @@ class PKCurveDataset(MolecularHDF5Dataset):
 
         dose = pk.get("dose_mg") or 100.0  # default 100mg if missing
         data.dose_mg = torch.tensor([float(dose)], dtype=torch.float32)
-        # Store as [1, T] so PyG batches to [batch, T]
-        data.obs_times = torch.tensor(pk["time_h"], dtype=torch.float32).unsqueeze(0)
-        data.obs_conc = torch.tensor(pk["conc_mg_L"], dtype=torch.float32).unsqueeze(0)
+        # Pad to 50 timepoints for uniform batching
+        max_t = 50
+        times = pk["time_h"][:max_t]
+        conc = pk["conc_mg_L"][:max_t]
+        n_obs = len(times)
+        # Pad with zeros + mask
+        times_padded = times + [0.0] * (max_t - n_obs)
+        conc_padded = conc + [0.0] * (max_t - n_obs)
+        data.obs_times = torch.tensor(times_padded, dtype=torch.float32).unsqueeze(0)  # [1, 50]
+        data.obs_conc = torch.tensor(conc_padded, dtype=torch.float32).unsqueeze(0)    # [1, 50]
+        data.obs_mask = torch.tensor(
+            [True] * n_obs + [False] * (max_t - n_obs), dtype=torch.bool
+        ).unsqueeze(0)  # [1, 50]
         kp = self.kp_baselines.get(mol_id, torch.ones(15, dtype=torch.float32))
         data.kp_baseline = kp.unsqueeze(0) if kp.dim() == 1 else kp  # [1, 15] for PyG
         return data

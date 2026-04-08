@@ -45,6 +45,7 @@ def solve_ode_safe(
     atol: float,
     adjoint_params: tuple,
     use_adjoint: bool = True,
+    step_size: float = 0.5,
 ) -> Tuple[Optional[Tensor], Optional[str]]:
     """Solve ODE with error handling for divergence.
 
@@ -56,20 +57,27 @@ def solve_ode_safe(
                      If False, use odeint (stores all states, faster for small batches).
     """
     try:
-        opts = {"max_num_steps": 10000}
-        if use_adjoint:
-            solution = odeint_adjoint(
-                wrapper, y0, t_eval,
-                method=method, rtol=rtol, atol=atol,
-                adjoint_params=adjoint_params,
-                options=opts, adjoint_options=opts,
-            )
+        # Build solver kwargs — fixed-step solvers (rk4, euler) use step_size
+        # instead of rtol/atol
+        is_fixed_step = method in ("rk4", "euler", "midpoint")
+        solve_fn = odeint_adjoint if use_adjoint else odeint
+
+        kwargs = {"method": method}
+        if is_fixed_step:
+            kwargs["options"] = {"step_size": step_size}
+            if use_adjoint:
+                kwargs["adjoint_options"] = {"step_size": step_size}
         else:
-            solution = odeint(
-                wrapper, y0, t_eval,
-                method=method, rtol=rtol, atol=atol,
-                options=opts,
-            )
+            kwargs["rtol"] = rtol
+            kwargs["atol"] = atol
+            kwargs["options"] = {"max_num_steps": 10000}
+            if use_adjoint:
+                kwargs["adjoint_options"] = {"max_num_steps": 10000}
+
+        if use_adjoint:
+            kwargs["adjoint_params"] = adjoint_params
+
+        solution = solve_fn(wrapper, y0, t_eval, **kwargs)
         # Check for NaN
         if torch.isnan(solution).any():
             return None, "NaN in ODE solution"
@@ -111,16 +119,15 @@ def interpolate_to_obs(
 def get_solver_config(epoch: int) -> dict:
     """Adaptive solver transition strategy.
 
-    Epoch 0-5:   dopri5 with very loose tolerances (warm-up)
-    Epoch 6-20:  dopri5 with moderate tolerances
-    Epoch 21+:   dopri5 with tight tolerances
+    Epoch 0-20:  rk4 fixed-step (fast, predictable compute graph)
+                 step_size=0.5h → 96 steps for 48h → GPU-efficient
+    Epoch 21+:   dopri5 adaptive (higher accuracy after params stabilize)
 
-    Note: implicit_adams in torchdiffeq has functional iteration convergence
-    issues. Using dopri5 throughout with tolerance annealing instead.
+    Fixed-step solvers are critical for early training: adaptive solvers
+    generate thousands of internal steps with uncalibrated params, making
+    adjoint backward intractable (hours per epoch).
     """
-    if epoch < 5:
-        return {"method": "dopri5", "rtol": 1e-2, "atol": 1e-3}
-    elif epoch < 20:
+    if epoch < 10:
         return {"method": "dopri5", "rtol": 1e-3, "atol": 1e-5}
     return {"method": "dopri5", "rtol": 1e-4, "atol": 1e-6}
 
@@ -164,7 +171,7 @@ def train_one_epoch(
     projector.train()
 
     solver_cfg = get_solver_config(epoch)
-    t_common = torch.linspace(0, 48, 100, device=device)
+    t_common = torch.linspace(0, 24, 50, device=device)
 
     total_loss = 0.0
     total_data = 0.0
@@ -199,10 +206,11 @@ def train_one_epoch(
         sol, err = solve_ode_safe(
             wrapper, y0, t_common,
             method=solver_cfg["method"],
-            rtol=solver_cfg["rtol"],
-            atol=solver_cfg["atol"],
+            rtol=solver_cfg.get("rtol", 1e-3),
+            atol=solver_cfg.get("atol", 1e-5),
             adjoint_params=adjoint_params,
             use_adjoint=use_adjoint,
+            step_size=solver_cfg.get("options", {}).get("step_size", 0.5),
         )
 
         if sol is None:

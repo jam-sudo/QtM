@@ -65,9 +65,9 @@ stage1:
 
 # ── Stage 2: ODE fine-tuning ─────────────────────────
 stage2:
-  epochs: 50
-  batch_size: 8
-  accum_steps: 4            # effective batch = 32
+  epochs: 10
+  batch_size: 1
+  accum_steps: 8            # effective batch = 8
   encoder_lr: 1.0e-5        # 10x lower than projector
   projector_lr: 1.0e-4
   weight_decay: 1.0e-5
@@ -84,4 +84,4 @@ loss:
 logging:
   run_log: logs/runs.jsonl
   checkpoint_dir: checkpoints/
-  save_every_epochs: 10
+  save_every_epochs: 1
