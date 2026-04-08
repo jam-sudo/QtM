@@ -68,7 +68,7 @@ Encoder warm-up on 3,308 molecules with scalar ADME labels (CLint, fup, Vdss, Ca
 Trains SchNet encoder to produce meaningful molecular representations before ODE fine-tuning.
 
 - Batch size 64, lr 1e-3, cosine annealing, 100 epochs
-- Best fup R&sup2; = 0.65
+- Train fup R&sup2; = 0.65
 
 ### Stage 2: PBPK ODE Fine-tuning
 
@@ -190,6 +190,7 @@ Per CLAUDE.md sections 6.1 and 6.2:
 
 ## References
 
+- Rodgers T, Rowland M. Mechanistic approaches to volume of distribution predictions: understanding the processes. Pharm Res. 2005;22(9):1495-1503.
 - Rodgers T, Rowland M. Physiologically based pharmacokinetic modelling 2: predicting the tissue distribution of acids, very weak bases, neutrals and zwitterions. J Pharm Sci. 2006;95(6):1238-1257.
 - Berezhkovskiy LM. Volume of distribution at steady state for a linear pharmacokinetic system with peripheral elimination. J Pharm Sci. 2004;93(6):1628-1640.
 - Schutt KT, et al. SchNet: A continuous-filter convolutional neural network for modeling quantum interactions. NeurIPS. 2017.
