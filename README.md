@@ -17,7 +17,7 @@ SMILES &rarr; 3D conformer &rarr; SchNet encoder &rarr; PBPK parameter projector
 | Module | Description | Parameters |
 |--------|-------------|------------|
 | **A** Quantum Generator | RDKit ETKDGv3 conformer + Gasteiger charges &rarr; HDF5 | Offline |
-| **B** SchNet Encoder | 3-layer continuous-filter convolution, E(n)-invariant | 254,080 |
+| **B** SchNet Encoder | 3-layer continuous-filter convolution, E(3)-invariant | 254,080 |
 | **C** Hierarchical Projector | Tissue-grouped attention &rarr; 30 drug-dependent ODE parameters | 18,846 |
 | **D** PBPK ODE | 34-node multigraph (ICRP Reference Man, 70 kg), 5 flux types | 0 (physics) |
 
@@ -42,6 +42,9 @@ Physiology source: ICRP Reference Man (cardiac output 390 L/h, body weight 70 kg
 | Effective permeability (Peff) | 1 | Sigmoid | [0.01, 10] &times;10<sup>-4</sup> cm/s |
 | Renal clearance | 1 | Sigmoid | [0.01, 20] L/h |
 | Particle radius | 1 | Sigmoid | [5, 50] &mu;m |
+| Solubility | 1 | Softplus | [0, &infin;) mg/mL |
+
+Solubility is predicted but not used in the ODE (reserved for future multi-task loss).
 
 Kp baselines computed via Rodgers & Rowland method with Berezhkovskiy correction.
 
@@ -69,7 +72,7 @@ Trains SchNet encoder to produce meaningful molecular representations before ODE
 
 ### Stage 2: PBPK ODE Fine-tuning
 
-Full pipeline (encoder &rarr; projector &rarr; ODE) on 265 drugs with clinical concentration-time curves.
+Full pipeline (encoder &rarr; projector &rarr; ODE) on clinical concentration-time curves (265 total, 245 in train split).
 
 - Encoder frozen (default config: `freeze_encoder_epochs` = `epochs` = 10)
 - Projector lr 1e-4, encoder lr 1e-5 (active when unfrozen), gradient accumulation (effective batch = 8)
@@ -83,6 +86,8 @@ Total = MSLE_PK + lambda(epoch) * Mass_Balance_Penalty
 lambda(epoch) = min(lambda_max, lambda_max * epoch / warmup_epochs)
 MSLE = mean( (log(1 + pred) - log(1 + obs))^2 )
 ```
+
+Note: default config has `warmup_epochs=20` with `stage2.epochs=10`, so &lambda; peaks at 0.45 (never reaches &lambda;_max=1.0).
 
 ## Dataset
 
@@ -128,7 +133,7 @@ python -m scripts.run_training --config configs/default.yaml --stage 2 --device 
 # Both stages sequentially
 python -m scripts.run_training --config configs/default.yaml --stage both --device cpu
 
-# Quick test run (3 epochs per stage)
+# Quick test run (Stage 1: 5 epochs, Stage 2: 3 epochs)
 python -m scripts.run_training --config configs/default.yaml --dry-run --device cpu
 ```
 
