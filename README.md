@@ -18,7 +18,7 @@ SMILES &rarr; 3D conformer &rarr; SchNet encoder &rarr; PBPK parameter projector
 |--------|-------------|------------|
 | **A** Quantum Generator | RDKit ETKDGv3 conformer + Gasteiger charges &rarr; HDF5 | Offline |
 | **B** SchNet Encoder | 3-layer continuous-filter convolution, E(3)-invariant | 254,080 |
-| **C** Hierarchical Projector | Tissue-grouped attention &rarr; 30 drug-dependent ODE parameters | 18,846 |
+| **C** Hierarchical Projector | Tissue-grouped attention &rarr; 30 drug parameters (29 used in ODE) | 18,846 |
 | **D** PBPK ODE | 34-node multigraph (ICRP Reference Man, 70 kg), 5 flux types | 0 (physics) |
 
 **Total trainable parameters: 272,926**
@@ -127,7 +127,7 @@ Outputs: `data/molecules.h5`, `data/splits.json`, `data/norm_stats.json`, `data/
 # Stage 1 only (ADME pretraining)
 python -m scripts.run_training --config configs/default.yaml --stage 1
 
-# Stage 2 only (ODE fine-tuning, requires Stage 1 checkpoint)
+# Stage 2 only (ODE fine-tuning, loads Stage 1 checkpoint if available)
 python -m scripts.run_training --config configs/default.yaml --stage 2 --device cpu
 
 # Both stages sequentially
