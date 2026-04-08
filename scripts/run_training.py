@@ -61,10 +61,13 @@ def run_stage1(cfg: dict, device: torch.device, dry_run: bool = False):
     with open(data_dir / "adme_labels.json") as f:
         adme_labels = json.load(f)
 
-    # Filter to molecules that have labels AND are in HDF5
-    train_ids = [mid for mid in train_ids if mid in adme_labels]
-    val_ids = [mid for mid in val_ids if mid in adme_labels]
-    logger.info(f"Train: {len(train_ids)} | Val: {len(val_ids)} molecules with ADME labels")
+    # Filter to molecules that have labels AND exist in HDF5
+    import h5py
+    with h5py.File(data_dir / "molecules.h5", "r") as hf:
+        hdf5_keys = set(hf.keys())
+    train_ids = [mid for mid in train_ids if mid in adme_labels and mid in hdf5_keys]
+    val_ids = [mid for mid in val_ids if mid in adme_labels and mid in hdf5_keys]
+    logger.info(f"Train: {len(train_ids)} | Val: {len(val_ids)} molecules with ADME labels + HDF5")
 
     if not train_ids:
         logger.warning("No training molecules with ADME labels. Skipping Stage 1.")
@@ -169,13 +172,16 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
     with open(data_dir / "pk_data.json") as f:
         pk_data = json.load(f)
 
-    # Filter train molecules with PK curves
+    # Filter train molecules with PK curves AND in HDF5
+    import h5py as _h5
+    with _h5.File(data_dir / "molecules.h5", "r") as hf:
+        hdf5_keys = set(hf.keys())
     train_pk_ids = [
         smiles_to_id[smiles_list[i]]
         for i in splits_data["train_indices"]
-        if smiles_to_id[smiles_list[i]] in pk_data
+        if smiles_to_id[smiles_list[i]] in pk_data and smiles_to_id[smiles_list[i]] in hdf5_keys
     ]
-    logger.info(f"Train molecules with CT curves: {len(train_pk_ids)}")
+    logger.info(f"Train molecules with CT curves + HDF5: {len(train_pk_ids)}")
 
     if not train_pk_ids:
         logger.warning("No training molecules with PK curves. Cannot run Stage 2.")
@@ -265,6 +271,7 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
             accum_steps=s2.get("accum_steps", 4),
             lambda_max=cfg["loss"]["lambda_max"],
             warmup_epochs=cfg["loss"]["warmup_epochs"],
+            use_adjoint=not dry_run,  # non-adjoint for dry run (faster)
         )
         scheduler.step()
 

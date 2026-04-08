@@ -118,16 +118,19 @@ def adme_multitask_loss(
     Returns:
         Dict with "total" and per-task losses.
     """
+    # Replace NaN with 0 in target to avoid NaN * 0 = NaN
+    safe_target = torch.where(task_mask, target, torch.zeros_like(target))
+
     # Per-task MSE with masking
-    sq_err = (pred - target) ** 2
-    masked = sq_err * task_mask.float()
+    sq_err = (pred - safe_target) ** 2 * task_mask.float()
 
     # Per-task mean
     counts = task_mask.float().sum(dim=0).clamp(min=1)
-    per_task = masked.sum(dim=0) / counts  # [K]
+    per_task = sq_err.sum(dim=0) / counts  # [K]
 
-    # Equal weight across tasks
-    total = per_task.mean()
+    # Equal weight across tasks (only tasks with data)
+    active = counts > 0
+    total = per_task[active].mean() if active.any() else pred.sum() * 0
 
     return {
         "total": total,

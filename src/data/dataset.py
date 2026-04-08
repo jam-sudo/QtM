@@ -134,10 +134,11 @@ class ADMEDataset(MolecularHDF5Dataset):
         labels = self.adme_labels.get(mol_id, {})
 
         # Build target vector — NaN for missing
-        targets = torch.full((len(self.target_names),), float("nan"), dtype=torch.float32)
+        # Store as [1, K] so PyG collates to [batch, K] not [batch*K]
+        targets = torch.full((1, len(self.target_names)), float("nan"), dtype=torch.float32)
         for i, name in enumerate(self.target_names):
             if name in labels:
-                targets[i] = labels[name]
+                targets[0, i] = labels[name]
 
         data.y = targets
         data.target_mask = ~torch.isnan(targets)
@@ -178,10 +179,11 @@ class PKCurveDataset(MolecularHDF5Dataset):
         mol_id = self.mol_ids[idx]
         pk = self.pk_data[mol_id]
 
-        data.dose_mg = torch.tensor([pk["dose_mg"]], dtype=torch.float32)
-        data.obs_times = torch.tensor(pk["time_h"], dtype=torch.float32)
-        data.obs_conc = torch.tensor(pk["conc_mg_L"], dtype=torch.float32)
-        data.kp_baseline = self.kp_baselines.get(
-            mol_id, torch.ones(15, dtype=torch.float32)
-        )
+        dose = pk.get("dose_mg") or 100.0  # default 100mg if missing
+        data.dose_mg = torch.tensor([float(dose)], dtype=torch.float32)
+        # Store as [1, T] so PyG batches to [batch, T]
+        data.obs_times = torch.tensor(pk["time_h"], dtype=torch.float32).unsqueeze(0)
+        data.obs_conc = torch.tensor(pk["conc_mg_L"], dtype=torch.float32).unsqueeze(0)
+        kp = self.kp_baselines.get(mol_id, torch.ones(15, dtype=torch.float32))
+        data.kp_baseline = kp.unsqueeze(0) if kp.dim() == 1 else kp  # [1, 15] for PyG
         return data

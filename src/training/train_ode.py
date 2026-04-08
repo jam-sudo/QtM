@@ -24,7 +24,7 @@ import torch.nn as nn
 from torch import Tensor
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torchdiffeq import odeint_adjoint
+from torchdiffeq import odeint, odeint_adjoint
 
 from src.data.graph_topology import PBPKTopology, load_topology
 from src.models.encoder import SchNetEncoder
@@ -44,20 +44,32 @@ def solve_ode_safe(
     rtol: float,
     atol: float,
     adjoint_params: tuple,
+    use_adjoint: bool = True,
 ) -> Tuple[Optional[Tensor], Optional[str]]:
     """Solve ODE with error handling for divergence.
 
     Returns (solution, None) on success, (None, error_msg) on failure.
     Divergent molecules are NEVER silently dropped (§6.1).
+
+    Args:
+        use_adjoint: If True, use odeint_adjoint (O(1) VRAM, slower).
+                     If False, use odeint (stores all states, faster for small batches).
     """
     try:
-        solution = odeint_adjoint(
-            wrapper, y0, t_eval,
-            method=method,
-            rtol=rtol,
-            atol=atol,
-            adjoint_params=adjoint_params,
-        )
+        opts = {"max_num_steps": 10000}
+        if use_adjoint:
+            solution = odeint_adjoint(
+                wrapper, y0, t_eval,
+                method=method, rtol=rtol, atol=atol,
+                adjoint_params=adjoint_params,
+                options=opts, adjoint_options=opts,
+            )
+        else:
+            solution = odeint(
+                wrapper, y0, t_eval,
+                method=method, rtol=rtol, atol=atol,
+                options=opts,
+            )
         # Check for NaN
         if torch.isnan(solution).any():
             return None, "NaN in ODE solution"
@@ -99,13 +111,17 @@ def interpolate_to_obs(
 def get_solver_config(epoch: int) -> dict:
     """Adaptive solver transition strategy.
 
-    Epoch 1-20:  implicit_adams (handles stiffness from uncalibrated params)
-    Epoch 21+:   dopri5 (faster, ~3-5x speedup)
+    Epoch 0-5:   dopri5 with very loose tolerances (warm-up)
+    Epoch 6-20:  dopri5 with moderate tolerances
+    Epoch 21+:   dopri5 with tight tolerances
 
-    Falls back to implicit_adams if dopri5 diverges.
+    Note: implicit_adams in torchdiffeq has functional iteration convergence
+    issues. Using dopri5 throughout with tolerance annealing instead.
     """
-    if epoch < 20:
-        return {"method": "implicit_adams", "rtol": 1e-3, "atol": 1e-5}
+    if epoch < 5:
+        return {"method": "dopri5", "rtol": 1e-2, "atol": 1e-3}
+    elif epoch < 20:
+        return {"method": "dopri5", "rtol": 1e-3, "atol": 1e-5}
     return {"method": "dopri5", "rtol": 1e-4, "atol": 1e-6}
 
 
@@ -119,6 +135,7 @@ def train_one_epoch(
     accum_steps: int = 4,
     lambda_max: float = 1.0,
     warmup_epochs: int = 20,
+    use_adjoint: bool = True,
 ) -> Dict[str, float]:
     """Train for one epoch.
 
@@ -147,7 +164,7 @@ def train_one_epoch(
     projector.train()
 
     solver_cfg = get_solver_config(epoch)
-    t_common = torch.linspace(0, 72, 200, device=device)
+    t_common = torch.linspace(0, 48, 100, device=device)
 
     total_loss = 0.0
     total_data = 0.0
@@ -185,6 +202,7 @@ def train_one_epoch(
             rtol=solver_cfg["rtol"],
             atol=solver_cfg["atol"],
             adjoint_params=adjoint_params,
+            use_adjoint=use_adjoint,
         )
 
         if sol is None:
@@ -206,9 +224,10 @@ def train_one_epoch(
 
             pred_at_obs = interpolate_to_obs(venous_conc[:, i], t_common, obs_t)
 
+            # pred_at_obs: [T_obs], obs_c: [T_obs] → reshape to [T_obs, 1] for loss
             loss_dict = annealed_pinn_loss(
-                pred_conc=pred_at_obs.unsqueeze(1),
-                obs_conc=obs_c.unsqueeze(1),
+                pred_conc=pred_at_obs.unsqueeze(-1),
+                obs_conc=obs_c.unsqueeze(-1),
                 solution=sol[:, i:i+1, :],
                 dose_mg=batch.dose_mg[i:i+1].squeeze(-1),
                 epoch=epoch,
