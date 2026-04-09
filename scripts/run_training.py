@@ -159,6 +159,12 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
     enc_cfg = cfg["encoder"]
     proj_cfg = cfg["projector"]
 
+    # Float64 for ODE backward stability: gradient through 800 rk4 steps
+    # reaches 10^186 which overflows float32 (max 3.4e38) but is within
+    # float64 range (max 1.8e308). Enables 4h BPTT windows vs 0.5h in float32.
+    torch.set_default_dtype(torch.float64)
+    logger.info("Using float64 for Stage 2 (ODE backward stability)")
+
     # Load topology
     topo = load_topology(cfg["data"]["physiology_yaml"])
     topo = topo.to(device)
@@ -228,12 +234,13 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
             logger.info(f"Loaded pretrained encoder from {ckpt}")
     else:
         encoder = encoder.to(device)
+    encoder = encoder.double()  # float64 for ODE backward stability
 
     projector = HierarchicalProjector(
         z_dim=proj_cfg["z_dim"], hidden_dim=proj_cfg["hidden_dim"],
-    ).to(device)
+    ).double().to(device)
 
-    pbpk_func = PBPKFunc(topo).to(device)
+    pbpk_func = PBPKFunc(topo).double().to(device)
 
     # Optimizer: separate LRs for encoder (lower) and projector
     param_groups = [
@@ -300,6 +307,7 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
     }
     run_logger.finalize("success", final_metrics)
     train_ds.close()
+    torch.set_default_dtype(torch.float32)  # restore default
     logger.info("Stage 2 complete.")
 
 

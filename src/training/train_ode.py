@@ -6,7 +6,7 @@ Trains the full QtM pipeline (encoder → projector → Neural ODE) on
 Key features:
 - PSSA (Pseudo-Steady State Approximation) for 3 central blood pools,
   reducing ODE stiffness from λ=1482 to λ≈118 h⁻¹
-- Windowed truncated BPTT (0.5h windows) for bounded memory backward
+- Windowed truncated BPTT (4h windows in float64) for bounded memory backward
 - rk4 fixed-step (dt=0.005h) for predictable compute graphs
 - Strict parameter clamping in Module C prevents solver blowup
 - Annealed PINN loss (data MSLE + mass balance)
@@ -227,6 +227,14 @@ def train_one_epoch(
 
     for batch_idx, batch in enumerate(dataloader):
         batch = batch.to(device)
+        # Convert float tensors to model dtype (float64 for ODE stability)
+        model_dtype = next(encoder.parameters()).dtype
+        for key in ['pos', 'charges', 'kp_baseline', 'dose_mg', 'obs_times', 'obs_conc']:
+            if hasattr(batch, key):
+                attr = getattr(batch, key)
+                if isinstance(attr, torch.Tensor) and attr.is_floating_point():
+                    setattr(batch, key, attr.to(dtype=model_dtype))
+
         batch_size = int(batch.batch.max().item()) + 1
         n_molecules += batch_size
 
@@ -244,7 +252,7 @@ def train_one_epoch(
             method=solver_cfg["method"],
             rtol=solver_cfg.get("rtol", 1e-2),
             atol=solver_cfg.get("atol", 1e-4),
-            window_hours=0.5,
+            window_hours=4.0,
             options=solver_cfg.get("options"),
         )
 
