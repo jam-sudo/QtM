@@ -5,9 +5,10 @@ Trains the full QtM pipeline (encoder → projector → Neural ODE) on
 
 Key features:
 - PSSA (Pseudo-Steady State Approximation) for 3 central blood pools,
-  reducing ODE stiffness from λ=1482 to λ≈118 h⁻¹
-- Windowed truncated BPTT (4h windows in float64) for bounded memory backward
-- rk4 fixed-step (dt=0.005h) for predictable compute graphs
+  reducing ODE stiffness from λ=1482 to λ≈662 h⁻¹
+- Forward sensitivity equations exploiting ODE linearity (dy/dt = M(θ)·y)
+  for full 24h gradient flow without backward through solver
+- rk4 fixed-step (dt=0.003h) — stable for λ_max < 927 h⁻¹
 - Strict parameter clamping in Module C prevents solver blowup
 - Annealed PINN loss (data MSLE + mass balance)
 - Solver divergence logging (§6.1)
@@ -31,6 +32,7 @@ from torchdiffeq import odeint
 
 from src.data.graph_topology import PBPKTopology, load_topology
 from src.models.encoder import SchNetEncoder
+from src.models.linear_sensitivity import solve_ode_with_sensitivity
 from src.models.ode_system import DrugParams, ODEWrapper, PBPKFunc, PSSAWrapper
 from src.models.projector import HierarchicalProjector
 from src.training.logger import RunLogger
@@ -242,24 +244,26 @@ def train_one_epoch(
         z_mol = encoder(batch.z, batch.pos, batch.charges, batch.edge_index, batch.batch)
         drug_params = projector(z_mol, batch.kp_baseline)
 
-        # ODE solve with PSSA (reduced 31-dim state)
+        # ODE solve with PSSA + forward sensitivity equations
+        # Exploits linearity of PBPK in y: dy/dt = M(θ)·y
+        # Gradient via forward sensitivity S = ∂y/∂θ (no backward through solver)
         wrapper = PSSAWrapper(pbpk_func, topo, drug_params)
-        y0 = torch.zeros(batch_size, wrapper.n_reduced, device=device)
+        y0 = torch.zeros(batch_size, wrapper.n_reduced, device=device, dtype=next(encoder.parameters()).dtype)
         y0[:, wrapper.stomach_idx_reduced] = batch.dose_mg.squeeze(-1)
 
-        sol, err = solve_ode_windowed(
-            wrapper, y0, t_common,
-            method=solver_cfg["method"],
-            rtol=solver_cfg.get("rtol", 1e-2),
-            atol=solver_cfg.get("atol", 1e-4),
-            window_hours=4.0,
-            options=solver_cfg.get("options"),
-        )
+        try:
+            sol = solve_ode_with_sensitivity(
+                pbpk_func, topo, drug_params, y0, t_common, step_size=0.003,
+            )
+            err = None
+        except RuntimeError as e:
+            sol = None
+            err = str(e)
 
-        if sol is None:
+        if sol is None or torch.isnan(sol).any():
             n_diverged += batch_size
             for i in range(batch_size):
-                run_logger.log_divergence(epoch, batch.mol_id[i], err)
+                run_logger.log_divergence(epoch, batch.mol_id[i], err or "NaN in solution")
             continue
 
         # Expand to full 34-node state for venous concentration + mass balance
