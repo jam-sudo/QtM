@@ -65,15 +65,16 @@ stage1:
 
 # ── Stage 2: ODE fine-tuning ─────────────────────────
 stage2:
-  epochs: 10
+  epochs: 15                 # forward sensitivity ~10min/epoch → 2.5h total
   batch_size: 1
-  accum_steps: 8            # effective batch = 8
-  encoder_lr: 1.0e-5        # 10x lower than projector
-  projector_lr: 1.0e-4
+  accum_steps: 4             # effective batch = 4 (was 8)
+  encoder_lr: 1.0e-4         # 10x lower than projector
+  projector_lr: 1.0e-3       # 10x higher: forward sensitivity grads ~0.5,
+                             # not clipped, so effective step was too small
   weight_decay: 1.0e-5
   scheduler: cosine
-  freeze_encoder_epochs: 10
-  grad_clip_norm: 1.0
+  freeze_encoder_epochs: 15
+  grad_clip_norm: 10.0       # raised: grads are physically bounded now
 
 # ── PINN loss ─────────────────────────────────────────
 loss:

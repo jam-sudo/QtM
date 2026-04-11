@@ -252,8 +252,10 @@ def train_one_epoch(
         y0[:, wrapper.stomach_idx_reduced] = batch.dose_mg.squeeze(-1)
 
         try:
+            # dt=0.001 is 2.5× safety margin for max_eig ≈ 1092 across molecules
+            # (2.78 / 1092 = 0.00254 rk4 boundary; use 2x smaller)
             sol = solve_ode_with_sensitivity(
-                pbpk_func, topo, drug_params, y0, t_common, step_size=0.003,
+                pbpk_func, topo, drug_params, y0, t_common, step_size=0.001,
             )
             err = None
         except RuntimeError as e:
@@ -319,7 +321,7 @@ def train_one_epoch(
             continue
 
         if (batch_idx + 1) % accum_steps == 0:
-            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=10.0)
             optimizer.step()
             optimizer.zero_grad()
 
@@ -333,7 +335,7 @@ def train_one_epoch(
         all_params = list(encoder.parameters()) + list(projector.parameters())
         has_nan = any(p.grad is not None and torch.isnan(p.grad).any() for p in all_params)
         if not has_nan:
-            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=10.0)
             optimizer.step()
         optimizer.zero_grad()
 
