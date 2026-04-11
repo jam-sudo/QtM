@@ -18,7 +18,7 @@ from pathlib import Path
 import torch
 import yaml
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
 from torch_geometric.loader import DataLoader
 
 from src.data.dataset import ADMEDataset, PKCurveDataset
@@ -242,6 +242,14 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
 
     pbpk_func = PBPKFunc(topo).double().to(device)
 
+    # Resume from existing Stage 2 checkpoint if requested
+    resume_ckpt = s2.get("resume_from")
+    if resume_ckpt and Path(resume_ckpt).exists():
+        ckpt = torch.load(resume_ckpt, map_location=device)
+        encoder.load_state_dict(ckpt["encoder"])
+        projector.load_state_dict(ckpt["projector"])
+        logger.info(f"Resumed from {resume_ckpt} (epoch {ckpt.get('epoch', '?')})")
+
     # Optimizer: separate LRs for encoder (lower) and projector
     param_groups = [
         {"params": projector.parameters(), "lr": s2["projector_lr"]},
@@ -250,7 +258,14 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
     optimizer = AdamW(param_groups, weight_decay=s2.get("weight_decay", 1e-5))
 
     n_epochs = 3 if dry_run else s2["epochs"]
-    scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs)
+    # Cosine warm restarts: T_0 epochs per cycle, doubles each cycle
+    sched_type = s2.get("scheduler", "cosine")
+    if sched_type == "cosine_warm_restarts":
+        T_0 = s2.get("scheduler_T_0", 10)
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=2)
+        logger.info(f"Using CosineAnnealingWarmRestarts(T_0={T_0}, T_mult=2)")
+    else:
+        scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs)
 
     run_logger = RunLogger(
         cfg["logging"]["run_log"], seed=cfg["split"]["seed"],
