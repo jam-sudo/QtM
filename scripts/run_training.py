@@ -263,8 +263,15 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
     resume_ckpt = s2.get("resume_from")
     if resume_ckpt and Path(resume_ckpt).exists():
         ckpt = torch.load(resume_ckpt, map_location=device)
-        encoder.load_state_dict(ckpt["encoder"])
-        projector.load_state_dict(ckpt["projector"])
+        encoder.load_state_dict(ckpt["encoder"], strict=False)
+        # Remap projector state_dict if dropout was added (old shared_mlp.2 → new .3)
+        proj_sd = ckpt["projector"]
+        remap = {"shared_mlp.2.weight": "shared_mlp.3.weight",
+                 "shared_mlp.2.bias": "shared_mlp.3.bias"}
+        remapped = {}
+        for k, v in proj_sd.items():
+            remapped[remap.get(k, k)] = v
+        projector.load_state_dict(remapped, strict=False)
         logger.info(f"Resumed from {resume_ckpt} (epoch {ckpt.get('epoch', '?')})")
 
     # Optimizer: separate LRs for encoder (lower) and projector
