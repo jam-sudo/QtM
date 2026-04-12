@@ -334,60 +334,10 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
             "metrics": metrics,
         }, ckpt_dir / f"stage2_epoch{epoch:03d}.pt")
 
-        # Validation evaluation (forward only, no grad)
-        val_loss_str = ""
-        if val_loader is not None:
-            encoder.eval()
-            projector.eval()
-            val_losses = []
-            with torch.no_grad():
-                for vb in val_loader:
-                    vb = vb.to(device)
-                    model_dtype = next(encoder.parameters()).dtype
-                    for k in ['pos','charges','kp_baseline','dose_mg','obs_times','obs_conc']:
-                        if hasattr(vb, k):
-                            a = getattr(vb, k)
-                            if isinstance(a, torch.Tensor) and a.is_floating_point():
-                                setattr(vb, k, a.to(dtype=model_dtype))
-                    try:
-                        z_v = encoder(vb.z, vb.pos, vb.charges, vb.edge_index, vb.batch)
-                        dp_v = projector(z_v, vb.kp_baseline)
-                        from src.models.linear_sensitivity import solve_ode_with_sensitivity
-                        wrap_v = PSSAWrapper(pbpk_func, topo, dp_v)
-                        y0_v = torch.zeros(1, wrap_v.n_reduced, device=device, dtype=model_dtype)
-                        y0_v[0, wrap_v.stomach_idx_reduced] = vb.dose_mg.squeeze(-1)
-                        t_c = torch.linspace(0, 24, 50, device=device, dtype=model_dtype)
-                        yt_v = solve_ode_with_sensitivity(pbpk_func, topo, dp_v, y0_v, t_c, step_size=0.001)
-                        sf_v = wrap_v.expand_solution(yt_v)
-                        ven_v = sf_v[:, :, topo.venous_idx] / (topo.volumes[topo.venous_idx] * dp_v.rbp.unsqueeze(0))
-                        from src.training.loss import msle_loss
-                        from src.training.train_ode import interpolate_to_obs
-                        ot, oc = vb.obs_times[0], vb.obs_conc[0]
-                        m = vb.obs_mask[0] if hasattr(vb, 'obs_mask') else torch.ones_like(ot, dtype=torch.bool)
-                        pred = interpolate_to_obs(ven_v[:, 0], t_c, ot[m])
-                        vl = msle_loss(pred, oc[m])
-                        val_losses.append(vl.item())
-                    except Exception:
-                        pass
-            if val_losses:
-                val_loss = sum(val_losses) / len(val_losses)
-                val_loss_str = f" | val={val_loss:.4f}"
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    torch.save({
-                        "epoch": epoch,
-                        "encoder": encoder.state_dict(),
-                        "projector": projector.state_dict(),
-                        "metrics": {**metrics, "val_loss": val_loss},
-                    }, ckpt_dir / "stage2_best_val.pt")
-                    val_loss_str += " *"
-            encoder.train()
-            projector.train()
-
         logger.info(
             f"Epoch {epoch:3d} | loss={metrics['loss']:.4f} | "
             f"data={metrics['data_loss']:.4f} | mb={metrics['mass_balance']:.6f} | "
-            f"div={metrics['divergence_rate']:.2%}{val_loss_str}"
+            f"div={metrics['divergence_rate']:.2%} | solver={metrics['solver']}"
         )
 
     final_metrics = {

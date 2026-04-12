@@ -75,8 +75,8 @@ stage2:
   scheduler_T_0: 10
   freeze_encoder_epochs: 30  # freeze encoder fully — 254K params caused overfit
   grad_clip_norm: 10.0
-  dropout: 0.2               # projector dropout
-  resume_from: checkpoints/stage2_fwdsens_v1/stage2_epoch014.pt  # v1 baseline (less overfit)
+  dropout: 0.0               # disabled — breaks linear sensitivity assumption
+  #resume_from: checkpoints/stage2_fwdsens_v1/stage2_epoch014.pt  # disabled for clean start
 
 # ── PINN loss ─────────────────────────────────────────
 loss:
