@@ -77,15 +77,17 @@ class HierarchicalProjector(nn.Module):
         hidden_dim: Internal hidden dimension. Default 64.
     """
 
-    def __init__(self, z_dim: int = 128, hidden_dim: int = 64):
+    def __init__(self, z_dim: int = 128, hidden_dim: int = 64, dropout: float = 0.2):
         super().__init__()
 
-        # Shared encoder
+        # Shared encoder with dropout for regularization
         self.shared_mlp = nn.Sequential(
             nn.Linear(z_dim, hidden_dim),
             nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
+            nn.Dropout(dropout),
         )
 
         # Group attention: learn to weight 5 super-groups

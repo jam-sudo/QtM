@@ -25,7 +25,7 @@ from src.data.dataset import ADMEDataset, PKCurveDataset
 from src.data.graph_topology import KP_TISSUE_NAMES, load_topology
 from src.data.normalization import NormStats
 from src.models.encoder import SchNetEncoder
-from src.models.ode_system import PBPKFunc
+from src.models.ode_system import PBPKFunc, PSSAWrapper
 from src.models.projector import HierarchicalProjector
 from src.training.logger import RunLogger
 from src.training.loss import adme_multitask_loss
@@ -219,6 +219,22 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
     )
     train_loader = DataLoader(train_ds, batch_size=s2["batch_size"], shuffle=True)
 
+    # Validation dataset
+    val_pk_ids = [
+        smiles_to_id[smiles_list[i]]
+        for i in splits_data["val_indices"]
+        if smiles_to_id[smiles_list[i]] in pk_data and smiles_to_id[smiles_list[i]] in hdf5_keys
+    ]
+    val_loader = None
+    if val_pk_ids:
+        val_ds = PKCurveDataset(
+            data_dir / "molecules.h5", val_pk_ids, pk_data, kp_baselines,
+            cutoff=enc_cfg["cutoff"], norm_stats=norm_stats,
+        )
+        val_loader = DataLoader(val_ds, batch_size=1)
+        logger.info(f"Val molecules with CT curves: {len(val_pk_ids)}")
+    best_val_loss = float("inf")
+
     # Models
     if encoder is None:
         encoder = SchNetEncoder(
@@ -238,6 +254,7 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
 
     projector = HierarchicalProjector(
         z_dim=proj_cfg["z_dim"], hidden_dim=proj_cfg["hidden_dim"],
+        dropout=s2.get("dropout", 0.0),
     ).double().to(device)
 
     pbpk_func = PBPKFunc(topo).double().to(device)
@@ -298,23 +315,73 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
         scheduler.step()
 
         run_logger.log_epoch(epoch, metrics)
+
+        # Save every epoch checkpoint
+        ckpt_dir = Path(cfg["logging"]["checkpoint_dir"])
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "epoch": epoch,
+            "encoder": encoder.state_dict(),
+            "projector": projector.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "metrics": metrics,
+        }, ckpt_dir / f"stage2_epoch{epoch:03d}.pt")
+
+        # Validation evaluation (forward only, no grad)
+        val_loss_str = ""
+        if val_loader is not None:
+            encoder.eval()
+            projector.eval()
+            val_losses = []
+            with torch.no_grad():
+                for vb in val_loader:
+                    vb = vb.to(device)
+                    model_dtype = next(encoder.parameters()).dtype
+                    for k in ['pos','charges','kp_baseline','dose_mg','obs_times','obs_conc']:
+                        if hasattr(vb, k):
+                            a = getattr(vb, k)
+                            if isinstance(a, torch.Tensor) and a.is_floating_point():
+                                setattr(vb, k, a.to(dtype=model_dtype))
+                    try:
+                        z_v = encoder(vb.z, vb.pos, vb.charges, vb.edge_index, vb.batch)
+                        dp_v = projector(z_v, vb.kp_baseline)
+                        from src.models.linear_sensitivity import solve_ode_with_sensitivity
+                        wrap_v = PSSAWrapper(pbpk_func, topo, dp_v)
+                        y0_v = torch.zeros(1, wrap_v.n_reduced, device=device, dtype=model_dtype)
+                        y0_v[0, wrap_v.stomach_idx_reduced] = vb.dose_mg.squeeze(-1)
+                        t_c = torch.linspace(0, 24, 50, device=device, dtype=model_dtype)
+                        yt_v = solve_ode_with_sensitivity(pbpk_func, topo, dp_v, y0_v, t_c, step_size=0.001)
+                        sf_v = wrap_v.expand_solution(yt_v)
+                        ven_v = sf_v[:, :, topo.venous_idx] / (topo.volumes[topo.venous_idx] * dp_v.rbp.unsqueeze(0))
+                        from src.training.loss import msle_loss
+                        from src.training.train_ode import interpolate_to_obs
+                        ot, oc = vb.obs_times[0], vb.obs_conc[0]
+                        m = vb.obs_mask[0] if hasattr(vb, 'obs_mask') else torch.ones_like(ot, dtype=torch.bool)
+                        pred = interpolate_to_obs(ven_v[:, 0], t_c, ot[m])
+                        vl = msle_loss(pred, oc[m])
+                        val_losses.append(vl.item())
+                    except Exception:
+                        pass
+            if val_losses:
+                val_loss = sum(val_losses) / len(val_losses)
+                val_loss_str = f" | val={val_loss:.4f}"
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    torch.save({
+                        "epoch": epoch,
+                        "encoder": encoder.state_dict(),
+                        "projector": projector.state_dict(),
+                        "metrics": {**metrics, "val_loss": val_loss},
+                    }, ckpt_dir / "stage2_best_val.pt")
+                    val_loss_str += " *"
+            encoder.train()
+            projector.train()
+
         logger.info(
             f"Epoch {epoch:3d} | loss={metrics['loss']:.4f} | "
             f"data={metrics['data_loss']:.4f} | mb={metrics['mass_balance']:.6f} | "
-            f"div={metrics['divergence_rate']:.2%} | solver={metrics['solver']}"
+            f"div={metrics['divergence_rate']:.2%}{val_loss_str}"
         )
-
-        # Save checkpoint
-        if (epoch + 1) % cfg["logging"].get("save_every_epochs", 10) == 0 or epoch == n_epochs - 1:
-            ckpt_dir = Path(cfg["logging"]["checkpoint_dir"])
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
-            torch.save({
-                "epoch": epoch,
-                "encoder": encoder.state_dict(),
-                "projector": projector.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "metrics": metrics,
-            }, ckpt_dir / f"stage2_epoch{epoch:03d}.pt")
 
     final_metrics = {
         "final_loss": metrics["loss"],
@@ -322,8 +389,10 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
     }
     run_logger.finalize("success", final_metrics)
     train_ds.close()
+    if val_loader is not None:
+        val_ds.close()
     torch.set_default_dtype(torch.float32)  # restore default
-    logger.info("Stage 2 complete.")
+    logger.info(f"Stage 2 complete. Best val loss: {best_val_loss:.4f}")
 
 
 def main():
