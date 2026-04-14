@@ -68,12 +68,13 @@ stage2:
   epochs: 30
   batch_size: 1
   accum_steps: 4
-  encoder_lr: 1.0e-4
+  encoder_lr: 1.0e-5         # 1/100 of projector — gentle encoder fine-tuning
   projector_lr: 1.0e-3
-  weight_decay: 1.0e-2       # 1000x stronger (was 1e-5) — regularize overfitting
+  weight_decay: 1.0e-2       # strong regularization
   scheduler: cosine_warm_restarts
   scheduler_T_0: 10
-  freeze_encoder_epochs: 30  # freeze encoder fully — 254K params caused overfit
+  freeze_encoder_epochs: 5   # freeze 5 epochs, then unfreeze at low LR
+  adme_weight: 0.1           # ADME multi-task loss weight
   grad_clip_norm: 10.0
   dropout: 0.0               # disabled — breaks linear sensitivity assumption
   #resume_from: checkpoints/stage2_fwdsens_v1/stage2_epoch014.pt  # disabled for clean start

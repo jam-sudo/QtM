@@ -307,6 +307,34 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
         "volumes": topo.volumes,
     }
 
+    # ADME multi-task: use Stage 1 ADME data in Stage 2 for encoder regularization
+    adme_loader = None
+    adme_head = None
+    if (data_dir / "adme_labels.json").exists():
+        with open(data_dir / "adme_labels.json") as f:
+            adme_labels = json.load(f)
+        adme_train_ids = [
+            smiles_to_id[smiles_list[i]]
+            for i in splits_data["train_indices"]
+            if smiles_to_id[smiles_list[i]] in adme_labels and smiles_to_id[smiles_list[i]] in hdf5_keys
+        ]
+        if adme_train_ids:
+            from src.data.dataset import ADMEDataset
+            from src.training.train_adme import ADMEHead
+            target_names = cfg["stage1"].get("target_names",
+                ["log_clint", "logit_fup", "log_vdss", "log_papp", "log_thalf"])
+            adme_ds = ADMEDataset(
+                data_dir / "molecules.h5", adme_train_ids, adme_labels,
+                cutoff=enc_cfg["cutoff"], norm_stats=norm_stats, target_names=target_names,
+            )
+            adme_loader = DataLoader(adme_ds, batch_size=64, shuffle=True)
+            adme_head = ADMEHead(
+                z_dim=enc_cfg["hidden_channels"], n_tasks=len(target_names),
+            ).double().to(device)
+            # Add ADME head params to optimizer
+            optimizer.add_param_group({"params": adme_head.parameters(), "lr": s2["projector_lr"]})
+            logger.info(f"ADME multi-task: {len(adme_train_ids)} molecules, {len(target_names)} tasks")
+
     for epoch in range(n_epochs):
         # Freeze/unfreeze encoder
         for p in encoder.parameters():
@@ -317,7 +345,10 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
             accum_steps=s2.get("accum_steps", 4),
             lambda_max=cfg["loss"]["lambda_max"],
             warmup_epochs=cfg["loss"]["warmup_epochs"],
-            use_adjoint=True,  # adjoint with only drug_params (~30 dims, fast)
+            use_adjoint=True,
+            adme_dataloader=adme_loader,
+            adme_head=adme_head,
+            adme_weight=s2.get("adme_weight", 0.1),
         )
         scheduler.step()
 

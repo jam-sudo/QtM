@@ -145,11 +145,9 @@ class HierarchicalProjector(nn.Module):
         delta_kp_raw = self.kp_head(h_unified)          # [batch, 15]
         # Kp = Kp_baseline × exp(tanh(Δ)) — range [base/e, base×e]
         kp = kp_baseline * torch.exp(torch.tanh(delta_kp_raw))
-        # Hard clamp: Kp_min=1.0 guarantees rk4 (dt=0.005h) stability.
-        # Worst case: kidney λ = Q*rbp/(V*Kp) = 74.1*2/(0.31*1.0) = 478 h⁻¹
-        # → λ*dt = 2.39 < 2.78 (rk4 stability limit).
-        # Kp<1.0 causes kidney λ*dt > 2.78 → solver divergence + NaN gradients.
-        kp = kp.clamp(min=1.0, max=50.0)
+        # Kp_min=0.5: forward sensitivity solver (dt=0.001) handles λ up to 2780.
+        # Worst case: kidney λ = 74.1*2/(0.31*0.5) = 956 < 2780. Stable.
+        kp = kp.clamp(min=0.5, max=50.0)
 
         # ── Enzyme affinities ────────────────────────────────────
         # Bounded sigmoid [0.001, 0.1] µL/min/pmol.

@@ -188,6 +188,9 @@ def train_one_epoch(
     lambda_max: float = 1.0,
     warmup_epochs: int = 20,
     use_adjoint: bool = True,
+    adme_dataloader=None,
+    adme_head=None,
+    adme_weight: float = 0.1,
 ) -> Dict[str, float]:
     """Train for one epoch.
 
@@ -339,6 +342,36 @@ def train_one_epoch(
             optimizer.step()
         optimizer.zero_grad()
 
+    # ADME multi-task pass (if enabled): 13× more molecules for encoder gradient
+    adme_loss_val = 0.0
+    if adme_dataloader is not None and adme_head is not None:
+        from src.training.loss import adme_multitask_loss
+        adme_head.train()
+        for adme_batch in adme_dataloader:
+            adme_batch = adme_batch.to(device)
+            model_dtype = next(encoder.parameters()).dtype
+            for key in ['pos', 'charges']:
+                if hasattr(adme_batch, key):
+                    attr = getattr(adme_batch, key)
+                    if isinstance(attr, torch.Tensor) and attr.is_floating_point():
+                        setattr(adme_batch, key, attr.to(dtype=model_dtype))
+
+            z_mol = encoder(adme_batch.z, adme_batch.pos, adme_batch.charges,
+                           adme_batch.edge_index, adme_batch.batch)
+            pred = adme_head(z_mol)
+            task_mask = ~torch.isnan(adme_batch.y)
+            loss_dict = adme_multitask_loss(pred, adme_batch.y.to(dtype=model_dtype), task_mask)
+            adme_loss = loss_dict["total"] * adme_weight
+            adme_loss.backward()
+            adme_loss_val += loss_dict["total"].item()
+
+        all_params = list(encoder.parameters()) + list(projector.parameters())
+        if adme_head is not None:
+            all_params += list(adme_head.parameters())
+        torch.nn.utils.clip_grad_norm_(all_params, max_norm=10.0)
+        optimizer.step()
+        optimizer.zero_grad()
+
     divergence_rate = n_diverged / max(n_molecules, 1)
     metrics = {
         "loss": total_loss / max(n_batches, 1),
@@ -348,6 +381,7 @@ def train_one_epoch(
         "n_molecules": n_molecules,
         "n_diverged": n_diverged,
         "solver": solver_cfg["method"],
+        "adme_loss": adme_loss_val,
     }
 
     return metrics
