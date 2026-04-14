@@ -280,16 +280,7 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
         {"params": encoder.parameters(), "lr": s2["encoder_lr"]},
     ]
     optimizer = AdamW(param_groups, weight_decay=s2.get("weight_decay", 1e-5))
-
     n_epochs = 3 if dry_run else s2["epochs"]
-    # Cosine warm restarts: T_0 epochs per cycle, doubles each cycle
-    sched_type = s2.get("scheduler", "cosine")
-    if sched_type == "cosine_warm_restarts":
-        T_0 = s2.get("scheduler_T_0", 10)
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=2)
-        logger.info(f"Using CosineAnnealingWarmRestarts(T_0={T_0}, T_mult=2)")
-    else:
-        scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs)
 
     run_logger = RunLogger(
         cfg["logging"]["run_log"], seed=cfg["split"]["seed"],
@@ -334,6 +325,15 @@ def run_stage2(cfg: dict, device: torch.device, encoder: SchNetEncoder | None = 
             # Add ADME head params to optimizer
             optimizer.add_param_group({"params": adme_head.parameters(), "lr": s2["projector_lr"]})
             logger.info(f"ADME multi-task: {len(adme_train_ids)} molecules, {len(target_names)} tasks")
+
+    # Create scheduler AFTER all param groups are added (including ADME head)
+    sched_type = s2.get("scheduler", "cosine")
+    if sched_type == "cosine_warm_restarts":
+        T_0 = s2.get("scheduler_T_0", 10)
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=2)
+        logger.info(f"Using CosineAnnealingWarmRestarts(T_0={T_0}, T_mult=2)")
+    else:
+        scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs)
 
     for epoch in range(n_epochs):
         # Freeze/unfreeze encoder
